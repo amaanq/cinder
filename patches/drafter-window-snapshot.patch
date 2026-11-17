@@ -1,0 +1,131 @@
+diff -ru a/core/engine.h b/core/engine.h
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -706,11 +706,12 @@
+     int  block_pass(const RadBatch* db, const char* what, int step);
+     /* A program's block drafter rides its window in the window snapshot: it stores its context
+      * in the context pass right behind the trunk step, and the snapshot is saved after that. Only
+-     * where the trunk's window is snapshotted at all (window_snapshots): a full-attention trunk
+-     * takes no snapshot for a drafter's window alone. */
++     * where a snapshot is taken at all, for the trunk's window (window_snapshots) or for linear
++     * state (linear_checkpoints): a full-attention trunk takes no snapshot for a drafter's window
++     * alone. */
+     bool drafter_window_snap(const Program& p) const {
+         return cfg_.n_spec > 0 && p.drafter.kind == RAD_DRAFT_BLOCK && p.drafter.depth > 0 &&
+-               window_snapshots(p, cfg_);
++               (window_snapshots(p, cfg_) || linear_checkpoints(p, cfg_));
+     }
+     /* The drafter's window rides in the window snapshot (KVManager::drafter_window_snapshot), so
+      * the checkpoint save waits for its context pass (save_checkpoints). */
+diff -ru a/core/mem/kv.cpp b/core/mem/kv.cpp
+--- a/core/mem/kv.cpp
++++ b/core/mem/kv.cpp
+@@ -275,14 +275,13 @@
+     /* Then the window behind a checkpoint, after the linear state (see has_window_snapshot). A
+      * trunk's window rides in the slot whether or not linear state is beside it: a hit resumes at
+      * a snapshot either way, and without the window there it could not resume at all. A drafter's
+-     * window rides there only on a model without linear state (set_drafter_window_snapshot). */
+-    bool has_state = false;
+-    for (const auto& p : plans_) has_state = has_state || p.stateful();
++     * window rides there where the engine saves the snapshot behind the drafter's context pass
++     * (set_drafter_window_snapshot), beside linear state or a trunk's window. */
+     for (size_t i = 1; i < plans_.size(); ++i) {
+         KVGroupPlan& p = plans_[i];
+         p.drafter = groups[i].drafter;
+         p.win_snap = p.kind == RAD_KV_WINDOW && p.window_blocks > 0 && !p.runtime_win &&
+-                     (!groups[i].drafter || (snap_drafter_ && !has_state));
++                     (!groups[i].drafter || snap_drafter_);
+         if (p.win_snap && !p.zero && p.n_layers > 0)
+             window_ck_bytes_ += p.window_blocks * p.bytes_per_block;
+     }
+diff -ru a/core/mem/kv.h b/core/mem/kv.h
+--- a/core/mem/kv.h
++++ b/core/mem/kv.h
+@@ -117,8 +117,8 @@
+                    ? (runtime_tokens + block_size - 1) / block_size : 0;
+     }
+     /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot), after any
+-     * linear state. Set for a trunk group, and for a drafter's group on a model without linear
+-     * state where the engine saves the snapshot behind the drafter's context pass
++     * linear state. Set for a trunk group, and for a drafter's group where the engine saves the
++     * snapshot behind the drafter's context pass
+      * (set_drafter_window_snapshot). Elsewhere a drafter's window is recomputed by draft refill,
+      * so its snapshot would not be read. */
+     bool        win_snap = false;
+diff -ru a/core/sched/geometry.cpp b/core/sched/geometry.cpp
+--- a/core/sched/geometry.cpp
++++ b/core/sched/geometry.cpp
+@@ -42,8 +42,8 @@
+ 
+ /* What a prefix hit restores beside the cached blocks: linear state, or a trunk's sliding window.
+  * Only the trunk's window makes a model take window snapshots; a block drafter's rides in them
+- * where they exist (KVManager::set_drafter_window_snapshot) and is recomputed by draft refill
+- * where they do not. A RAD_KV_RING group has no snapshot at all
++ * or beside linear state (KVManager::set_drafter_window_snapshot) and is recomputed by draft
++ * refill where no snapshot is taken. A RAD_KV_RING group has no snapshot at all
+  * (KVManager::declare_runtime_window): its window is each sequence's own prompt length, which no
+  * slot could describe, so it is sized for the context plus a ring and is never checkpointed. */
+ static void restored_state(const Program& prog, bool* linear, bool* window) {
+@@ -64,6 +64,12 @@
+     return !linear && window && cfg.prefix_cache && cfg.checkpoint_interval > 0;
+ }
+ 
++bool linear_checkpoints(const Program& prog, const Config& cfg) {
++    bool linear = false, window = false;
++    restored_state(prog, &linear, &window);
++    return linear && cfg.prefix_cache && cfg.checkpoint_interval > 0;
++}
++
+ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry* out) {
+     if (!out) return RAD_E_INVAL;
+     ChunkGeometry g;
+diff -ru a/core/sched/geometry.h b/core/sched/geometry.h
+--- a/core/sched/geometry.h
++++ b/core/sched/geometry.h
+@@ -95,6 +95,8 @@
+  * reporting the geometry: a trunk's sliding window, no linear state, a prefix cache and an
+  * interval. Bring-up asks it before the geometry is resolved (Engine::drafter_window_snap). */
+ bool window_snapshots(const Program& prog, const Config& cfg);
++/* The same for a model with linear state: its checkpoints under a prefix cache and an interval. */
++bool linear_checkpoints(const Program& prog, const Config& cfg);
+ 
+ /* Resolve the geometry from the declared program and the operator's budgets.
+  *
+diff -ru a/tests/mem_test.cpp b/tests/mem_test.cpp
+--- a/tests/mem_test.cpp
++++ b/tests/mem_test.cpp
+@@ -1849,8 +1849,9 @@
+ }
+ 
+ /* A window is snapshotted only where a hit resumes from it: the trunk's window, with or without
+- * linear state beside it. A drafter's window is recomputed by draft refill, so a window section
+- * there would be copied and never read. */
++ * linear state beside it, and a drafter's window where the engine saves the snapshot behind the
++ * drafter's context pass. Elsewhere a drafter's window is recomputed by draft refill, so a window
++ * section there would be copied and never read. */
+ TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
+     KVGroupInfo w = paged_group("swa", RAD_KV_WINDOW, 2, 16, { 6 }, 64);
+     const Config cfg = small_config();
+@@ -1895,7 +1896,7 @@
+         REQUIRE(d && d->win_snap && d->drafter);
+         CHECK_EQ(kv.checkpoint_bytes(), d->window_blocks * d->bytes_per_block);
+     }
+-    {   /* beside linear state the flag changes nothing: a hit there re-prefills the window */
++    {   /* beside linear state the drafter's window rides after it in the slot */
+         std::vector<KVGroupInfo> g = hybrid_groups();
+         w.drafter = true;
+         g.push_back(w);
+@@ -1904,8 +1905,11 @@
+         KVManager kv;
+         kv.set_drafter_window_snapshot(true);
+         CHECK_OK(kv.configure(g, cfg, p.kv()));
+-        CHECK(!kv.has_window_snapshot());
+-        CHECK(!kv.drafter_window_snapshot());
++        CHECK(kv.has_window_snapshot());
++        CHECK(kv.drafter_window_snapshot());
++        const KVGroupPlan* d = kv.plan((int32_t)g.size() - 1);
++        REQUIRE(d && d->win_snap && d->drafter);
++        CHECK_EQ(kv.checkpoint_bytes(), 16384ll + d->window_blocks * d->bytes_per_block);
+     }
+ }
+ 
