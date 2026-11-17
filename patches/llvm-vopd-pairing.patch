@@ -1,0 +1,13 @@
+diff --git a/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp b/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp
+index 29dec3b8b..b241a2f24 100644
+--- a/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp
++++ b/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp
+@@ -486,6 +486,8 @@ struct VOPDPairingMutation : ScheduleDAGMutation {
+           continue;
+ 
+         if (fuseInstructionPair(*DAG, *ISUI, *JSUI)) {
++          // Fusion adds edges, so cached transitive load dependencies are stale.
++          LoadPredsComputed.reset();
+           // Clear to prevent future checks/fusing
+           VOPDCapable[JIdx] = false;
+           break;

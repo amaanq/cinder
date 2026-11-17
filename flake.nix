@@ -11,7 +11,8 @@
     in
     {
       packages.${system} = {
-        radiance = pkgs.callPackage ./package.nix { };
+        hip-clang = pkgs.callPackage ./hip-clang.nix { };
+        radiance = pkgs.callPackage ./package.nix { inherit (self.packages.${system}) hip-clang; };
         default = self.packages.${system}.radiance;
       };
 
