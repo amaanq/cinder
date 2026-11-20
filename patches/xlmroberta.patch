@@ -1,0 +1,946 @@
+diff --git a/arch/xlmroberta/CMakeLists.txt b/arch/xlmroberta/CMakeLists.txt
+new file mode 100644
+index 0000000000..a93bf5d86c
+--- /dev/null
++++ b/arch/xlmroberta/CMakeLists.txt
+@@ -0,0 +1,10 @@
++# Built in radiance's tree, or standalone against an installed radiance
++# (`cmake -S arch/xlmroberta -B build -DCMAKE_PREFIX_PATH=<radiance prefix>`); see cmake/RadAddPlugin.cmake.
++if(NOT COMMAND rad_add_plugin)
++  cmake_minimum_required(VERSION 3.21)
++  project(xlmroberta LANGUAGES CXX)
++  find_package(radiance REQUIRED)
++  rad_plugin_defaults()
++endif()
++
++rad_add_plugin(xlmroberta architectures SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/xlmroberta.cpp)
+diff --git a/arch/xlmroberta/xlmroberta.cpp b/arch/xlmroberta/xlmroberta.cpp
+new file mode 100644
+index 0000000000..7dccf72492
+--- /dev/null
++++ b/arch/xlmroberta/xlmroberta.cpp
+@@ -0,0 +1,445 @@
++/* xlmroberta -- XLM-RoBERTa (model_type xlm-roberta), the encoder behind BGE-M3 and
++ * BGE-reranker-v2-m3. bf16 weights and activations, with f32 norms and biases.
++ *
++ * An embedding model: it declares a pooled output (rad_declare_pooled) and no logits, so the
++ * engine runs it with no sampler and no KV cache and carries every input whole in one step.
++ *
++ * Shape (both BGE checkpoints):
++ *
++ *   24 layers, hidden 1024, 16 heads of 64, ffn 4096, vocab 250002, type vocab 1
++ *   post-norm block: a = out(attn(Wqkv h + b)) + b_out; h = LN1(h + a)
++ *                    m = fc2(gelu(fc1 h + b1)) + b2;    h = LN2(h + m)
++ *   separate query, key and value projections, fused into one [q|k|v] at convert time
++ *   non-causal, scale 1/sqrt(64) = 0.125, no rotary
++ *   embeddings: word + position + token_type, then LayerNorm. Position ids start at
++ *   pad_token_id + 1 = 2, so the plugin maps the table's rows from 2 on and looks up row p for
++ *   position p
++ *
++ * The pooled row depends on the checkpoint:
++ *
++ *   XLMRobertaModel          the first token's (<s>) hidden row, [n_embd]
++ *     with sparse_linear=1   then BGE-M3's sparse_linear logit of every position, [max_ctx]:
++ *                            row width n_embd + max_ctx, positions past the input zero. The
++ *                            logit is before BGE-M3's relu, and the client keeps the positive ones
++ *                            and takes the maximum per token id, which needs the token ids it
++ *                            sent. The head ships as sparse_linear.pt; renamed .pth, the
++ *                            checkpoint reader takes its tensors as sparse_linear.*
++ *   XLMRobertaForSequence-   the classification head over <s>, out_proj(tanh(dense h + b)) + b,
++ *   Classification           one f32 logit per input. out_proj runs in f32: in bf16 a logit near
++ *                            8 would be rounded to a multiple of 1/16
++ *
++ * The server L2-normalizes an embedding unless the request sets `normalize: false`, which both
++ * pooled forms need.
++ */
++#include <arch/rad_arch.h>
++
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++namespace xlmroberta {
++
++using namespace rad::arch;
++
++/* RoBERTa's padding_idx: position ids count up from pad_token_id + 1. */
++constexpr int64_t kPositionBase = 2;
++
++struct Layer {
++    rad_weight w_qkv = 0, b_qkv = 0, w_out = 0, b_out = 0, w_norm1 = 0, b_norm1 = 0;
++    rad_weight w_fc1 = 0, b_fc1 = 0, w_fc2 = 0, b_fc2 = 0, w_norm2 = 0, b_norm2 = 0;
++    rad_op op_qkv = 0, op_attn = 0, op_out = 0, op_norm1 = 0, op_fc1 = 0, op_fc2 = 0, op_norm2 = 0;
++};
++
++struct Model {
++    Names nm{""};
++    Geom  g{};
++    bool  classifier = false;
++    bool  sparse = false;
++    int64_t width = 0;    /* the pooled row */
++
++    rad_buf b_x = 0, b_h = 0, b_o = 0, b_pe = 0, b_qkv = 0, b_att = 0, b_ff = 0;
++    rad_buf b_cls = 0, b_pooled = 0;
++    rad_buf b_ct = 0, b_cf = 0;
++    rad_buf b_sw = 0, b_swf = 0, b_lane = 0, b_tab = 0, b_sidx = 0;
++
++    rad_weight w_tok = 0, w_pos = 0, w_type = 0, w_emb_ln = 0, b_emb_ln = 0;
++    rad_weight w_cd = 0, b_cd = 0, w_co = 0, b_co = 0;
++    rad_weight w_sl = 0, b_sl = 0;
++
++    rad_op op_embed = 0, op_pos = 0, op_pos_add = 0, op_type = 0, op_emb_ln = 0, op_cls = 0;
++    rad_op op_cast = 0;
++    rad_op op_cd = 0, op_ct = 0, op_co = 0;
++    rad_op op_sl = 0, op_sl_cast = 0, op_lane = 0, op_tab = 0, op_sidx = 0, op_zero = 0;
++    rad_op op_scatter = 0;
++
++    std::vector<Layer> layers;
++};
++
++static Model g_model[MAX_SLOTS];
++
++static int probe(const RadModelMeta* meta, RadArchProbe* out) {
++    if (!meta || !out) return RAD_E_INVAL;
++    out->draft_depth = 0;
++    const char* mt = rad_meta_gets(meta, "model_type", nullptr);
++    if (mt && *mt && std::strcmp(mt, "xlm-roberta") && std::strcmp(mt, "xlmroberta")) {
++        fprintf(stderr, "radiance: xlmroberta: model_type '%s' is not xlm-roberta\n", mt);
++        return RAD_E_UNSUPPORTED;
++    }
++    return RAD_OK;
++}
++
++static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
++    if (!b || !meta || !ctx) return RAD_E_INVAL;
++    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
++        return RAD_E_INVAL;
++    if (ctx->world_size > 1) {
++        fprintf(stderr, "radiance: xlmroberta runs on one card (--tp 1); the model is 568M "
++                        "parameters\n");
++        return RAD_E_UNSUPPORTED;
++    }
++
++    Model& m = g_model[rad_build_slot(ctx)];
++    m = Model{};
++    m.nm = Names(ctx->scope);
++    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
++    Geom&  g  = m.g;
++    Names& nm = m.nm;
++    const int64_t T = g.max_tok, E = g.n_embd, S = g.max_seqs;
++
++    const char* archs = rad_meta_gets(meta, "architectures", "");
++    m.classifier = std::strstr(archs, "ForSequenceClassification") != nullptr;
++    m.sparse = rad_meta_geti(meta, "sparse_linear", 0) != 0;
++    if (m.classifier && m.sparse) {
++        fprintf(stderr, "radiance: xlmroberta: sparse_linear is BGE-M3's head over the bare "
++                        "encoder; this checkpoint is a classifier\n");
++        return RAD_E_UNSUPPORTED;
++    }
++    if (!m.classifier && !std::strstr(archs, "XLMRobertaModel")) {
++        fprintf(stderr, "radiance: xlmroberta: architectures '%s'; this plugin serves "
++                        "XLMRobertaModel and XLMRobertaForSequenceClassification\n", archs);
++        return RAD_E_UNSUPPORTED;
++    }
++    const char* pet = rad_meta_gets(meta, "position_embedding_type", nullptr);
++    if (pet && *pet && std::strcmp(pet, "absolute")) {
++        fprintf(stderr, "radiance: xlmroberta: position_embedding_type '%s'; this plugin serves "
++                        "absolute positions\n", pet);
++        return RAD_E_UNSUPPORTED;
++    }
++    const char* act = rad_meta_gets(meta, "hidden_act", nullptr);
++    if (act && *act && std::strcmp(act, "gelu")) {
++        fprintf(stderr, "radiance: xlmroberta: hidden_act '%s'; this plugin serves exact gelu\n",
++                act);
++        return RAD_E_UNSUPPORTED;
++    }
++    if (rad_meta_geti(meta, "type_vocab_size", 1) != 1) {
++        fprintf(stderr, "radiance: xlmroberta: type_vocab_size %lld; this plugin adds the one "
++                        "token-type row\n", (long long)rad_meta_geti(meta, "type_vocab_size", 1));
++        return RAD_E_UNSUPPORTED;
++    }
++    if (rad_meta_geti(meta, "pad_token_id", 1) != kPositionBase - 1) {
++        fprintf(stderr, "radiance: xlmroberta: pad_token_id %lld; position ids start at "
++                        "pad_token_id + 1, and this plugin maps the table from row %lld\n",
++                (long long)rad_meta_geti(meta, "pad_token_id", 1), (long long)kPositionBase);
++        return RAD_E_UNSUPPORTED;
++    }
++    if (g.n_layer <= 0 || E <= 0 || g.n_head <= 0 || g.head_dim <= 0 || g.n_ff <= 0 ||
++        g.n_vocab <= 0 || g.n_head_kv != g.n_head || g.head_dim * g.n_head != E) {
++        fprintf(stderr, "radiance: xlmroberta: the container does not describe the model "
++                        "(layers %lld, hidden %lld, heads %lld of %lld, ffn %lld, vocab %lld)\n",
++                (long long)g.n_layer, (long long)E, (long long)g.n_head,
++                (long long)g.head_dim, (long long)g.n_ff, (long long)g.n_vocab);
++        return RAD_E_INVAL;
++    }
++    const int64_t n_pos = meta->n_ctx_train - kPositionBase;
++    if (n_pos <= 0 || g.max_ctx > n_pos) {
++        fprintf(stderr, "radiance: xlmroberta: --max-model-len %lld; the position table holds "
++                        "%lld positions\n", (long long)g.max_ctx, (long long)n_pos);
++        return RAD_E_UNSUPPORTED;
++    }
++    const int64_t L = g.max_ctx;
++    m.width = m.classifier ? 1 : m.sparse ? E + L : E;
++    const char* pre = m.classifier ? "roberta." : "";
++
++    m.b_x   = decl_b(b, nm.f("x"),    RAD_BF16, {T, E});
++    m.b_h   = decl_b(b, nm.f("h"),    RAD_BF16, {T, E});
++    m.b_o   = decl_b(b, nm.f("o"),    RAD_BF16, {T, E});
++    m.b_pe  = decl_b(b, nm.f("pe"),   RAD_BF16, {T, E});
++    m.b_qkv = decl_b(b, nm.f("qkv"),  RAD_BF16, {T, 3 * E});
++    m.b_att = decl_b(b, nm.f("attn"), RAD_BF16, {T, E});
++    m.b_ff  = decl_b(b, nm.f("ff"),   RAD_BF16, {T, g.n_ff});
++    m.b_cls = decl_b(b, nm.f("cls"),  RAD_BF16, {S, E});
++    m.b_pooled = decl_b(b, nm.f("pooled"), RAD_F32, {S, m.width}, RAD_BUF_PERSIST);
++    RAD_ARCH_TRY(rad_declare_pooled(b, m.b_pooled));
++
++    RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"),
++                          nm.ckpt("%sembeddings.word_embeddings.weight", pre)));
++    RAD_ARCH_TRY(map_rows(b, nm.f("position_embd.weight"),
++                          {{nm.ckpt("%sembeddings.position_embeddings.weight", pre),
++                            (int)kPositionBase, n_pos}}));
++    RAD_ARCH_TRY(map_copy(b, nm.f("token_type.weight"),
++                          nm.ckpt("%sembeddings.token_type_embeddings.weight", pre)));
++    RAD_ARCH_TRY(map_copy(b, nm.f("emb_ln.weight"), nm.ckpt("%sembeddings.LayerNorm.weight", pre)));
++    RAD_ARCH_TRY(map_copy(b, nm.f("emb_ln.bias"),   nm.ckpt("%sembeddings.LayerNorm.bias", pre)));
++    const int A = RAD_ACCESS_PER_TOKEN, N = RAD_SHARD_NONE;
++    m.w_tok    = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, E},
++                        RAD_ACCESS_VOCAB, N, grp_model());
++    m.w_pos    = decl_w(b, nm.f("position_embd.weight"), RAD_BF16, {n_pos, E}, A, N, grp_model());
++    m.w_type   = decl_w(b, nm.f("token_type.weight"), RAD_BF16, {1, E}, A, N, grp_model());
++    m.w_emb_ln = decl_w(b, nm.f("emb_ln.weight"), RAD_F32, {E}, A, N, grp_model());
++    m.b_emb_ln = decl_w(b, nm.f("emb_ln.bias"),   RAD_F32, {E}, A, N, grp_model());
++
++    auto layernorm_op = [&](rad_weight w, rad_weight bias) {
++        return RAD_OP(b, "layernorm",
++                      RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
++                                 RAD_F64("eps", g.eps), RAD_STR("dtype", "bf16")),
++                      RAD_WEIGHTS(w, bias));
++    };
++    auto gemm_bias_op = [&](int64_t rows, int64_t Nout, int64_t K, rad_weight w, rad_weight bias,
++                            const char* dtype, const char* act_name) {
++        return RAD_OP(b, "gemm_nt_bias",
++                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", Nout), RAD_INT("K", K),
++                                 RAD_STR("dtype", dtype), RAD_STR("act", act_name)),
++                      RAD_WEIGHTS(w, bias));
++    };
++    auto embed_op = [&](int64_t rows, rad_weight w) {
++        return RAD_OP(b, "embed_lookup",
++                      RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", E),
++                                 RAD_INT("n_vocab", rows), RAD_STR("dtype", "bf16"),
++                                 RAD_INT("vocab_offset", 0), RAD_F64("mult", 1.0)),
++                      RAD_WEIGHTS(w));
++    };
++    auto cast_op = [&](int64_t rows, int64_t n, const char* from, const char* to) {
++        return RAD_OP(b, "cast",
++                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("from", from),
++                                 RAD_STR("to", to)),
++                      RAD_NOWEIGHTS);
++    };
++
++    m.op_embed = rw(b, embed_op(g.n_vocab, m.w_tok), {}, {m.b_o});
++    m.op_pos = rw(b, embed_op(n_pos, m.w_pos), {}, {m.b_pe});
++    m.op_pos_add = rw(b, RAD_OP(b, "add",
++                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
++                                           RAD_STR("dtype", "bf16")),
++                                RAD_NOWEIGHTS),
++                      {m.b_o, m.b_pe}, {m.b_o});
++    m.op_type = rw(b, RAD_OP(b, "table_add",
++                             RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_INT("L", 1),
++                                        RAD_STR("dtype", "bf16")),
++                             RAD_WEIGHTS(m.w_type)),
++                   {m.b_o}, {m.b_o});
++    m.op_emb_ln = rw(b, layernorm_op(m.w_emb_ln, m.b_emb_ln), {m.b_o}, {m.b_x});
++
++    m.layers.resize((size_t)g.n_layer);
++    for (int64_t l = 0; l < g.n_layer; ++l) {
++        Layer& y = m.layers[(size_t)l];
++        const long long ll = (long long)l;
++        const RadWeightGroup gl = grp_layer((int)l);
++        auto src = [&](const char* s) { return nm.ckpt("%sencoder.layer.%lld.%s", pre, ll, s); };
++
++        RAD_ARCH_TRY(map_concat(b, nm.f("blk.%lld.attn_qkv.weight", ll),
++                                {src("attention.self.query.weight"),
++                                 src("attention.self.key.weight"),
++                                 src("attention.self.value.weight")}));
++        RAD_ARCH_TRY(map_concat(b, nm.f("blk.%lld.attn_qkv.bias", ll),
++                                {src("attention.self.query.bias"), src("attention.self.key.bias"),
++                                 src("attention.self.value.bias")}));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_out.weight", ll),
++                              src("attention.output.dense.weight")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_out.bias", ll),
++                              src("attention.output.dense.bias")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_norm.weight", ll),
++                              src("attention.output.LayerNorm.weight")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_norm.bias", ll),
++                              src("attention.output.LayerNorm.bias")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_fc1.weight", ll),
++                              src("intermediate.dense.weight")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_fc1.bias", ll), src("intermediate.dense.bias")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_fc2.weight", ll), src("output.dense.weight")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_fc2.bias", ll),   src("output.dense.bias")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_norm.weight", ll),
++                              src("output.LayerNorm.weight")));
++        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_norm.bias", ll), src("output.LayerNorm.bias")));
++
++        y.w_qkv   = decl_w(b, nm.f("blk.%lld.attn_qkv.weight", ll), RAD_BF16, {3 * E, E}, A, N, gl);
++        y.b_qkv   = decl_w(b, nm.f("blk.%lld.attn_qkv.bias", ll),   RAD_F32, {3 * E}, A, N, gl);
++        y.w_out   = decl_w(b, nm.f("blk.%lld.attn_out.weight", ll), RAD_BF16, {E, E}, A, N, gl);
++        y.b_out   = decl_w(b, nm.f("blk.%lld.attn_out.bias", ll),   RAD_F32, {E}, A, N, gl);
++        y.w_norm1 = decl_w(b, nm.f("blk.%lld.attn_norm.weight", ll), RAD_F32, {E}, A, N, gl);
++        y.b_norm1 = decl_w(b, nm.f("blk.%lld.attn_norm.bias", ll),   RAD_F32, {E}, A, N, gl);
++        y.w_fc1   = decl_w(b, nm.f("blk.%lld.ffn_fc1.weight", ll), RAD_BF16, {g.n_ff, E}, A, N, gl);
++        y.b_fc1   = decl_w(b, nm.f("blk.%lld.ffn_fc1.bias", ll),   RAD_F32, {g.n_ff}, A, N, gl);
++        y.w_fc2   = decl_w(b, nm.f("blk.%lld.ffn_fc2.weight", ll), RAD_BF16, {E, g.n_ff}, A, N, gl);
++        y.b_fc2   = decl_w(b, nm.f("blk.%lld.ffn_fc2.bias", ll),   RAD_F32, {E}, A, N, gl);
++        y.w_norm2 = decl_w(b, nm.f("blk.%lld.ffn_norm.weight", ll), RAD_F32, {E}, A, N, gl);
++        y.b_norm2 = decl_w(b, nm.f("blk.%lld.ffn_norm.bias", ll),   RAD_F32, {E}, A, N, gl);
++
++        y.op_qkv = rw(b, gemm_bias_op(T, 3 * E, E, y.w_qkv, y.b_qkv, "bf16", "none"),
++                      {m.b_x}, {m.b_qkv});
++        y.op_attn = rw(b, RAD_OP(b, "attn_dense",
++                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", g.head_dim),
++                                            RAD_INT("gqa", 1), RAD_INT("causal", 0),
++                                            RAD_STR("dtype", "bf16"), RAD_F64("scale", 0.125),
++                                            RAD_INT("max_seqlen", T)),
++                                 RAD_NOWEIGHTS),
++                       {m.b_qkv}, {m.b_att});
++        y.op_out = rw(b, gemm_bias_op(T, E, E, y.w_out, y.b_out, "bf16", "none"),
++                      {m.b_att, m.b_x}, {m.b_x});
++        y.op_norm1 = rw(b, layernorm_op(y.w_norm1, y.b_norm1), {m.b_x}, {m.b_h});
++        y.op_fc1 = rw(b, gemm_bias_op(T, g.n_ff, E, y.w_fc1, y.b_fc1, "bf16", "gelu"),
++                      {m.b_h}, {m.b_ff});
++        y.op_fc2 = rw(b, gemm_bias_op(T, E, g.n_ff, y.w_fc2, y.b_fc2, "bf16", "none"),
++                      {m.b_ff, m.b_h}, {m.b_o});
++        y.op_norm2 = rw(b, layernorm_op(y.w_norm2, y.b_norm2), {m.b_o}, {m.b_x});
++
++        if (!y.op_qkv || !y.op_attn || !y.op_out || !y.op_norm1 || !y.op_fc1 || !y.op_fc2 ||
++            !y.op_norm2)
++            return RAD_E_INVAL;
++    }
++
++    m.op_cls = rw(b, RAD_OP(b, "gather_rows",
++                            RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", E),
++                                       RAD_STR("dtype", "bf16")),
++                            RAD_NOWEIGHTS),
++                  {m.b_x}, {m.b_cls});
++
++    if (m.classifier) {
++        RAD_ARCH_TRY(map_copy(b, nm.f("cls_dense.weight"), "classifier.dense.weight"));
++        RAD_ARCH_TRY(map_copy(b, nm.f("cls_dense.bias"),   "classifier.dense.bias"));
++        RAD_ARCH_TRY(map_copy(b, nm.f("cls_out.weight"),   "classifier.out_proj.weight"));
++        RAD_ARCH_TRY(map_copy(b, nm.f("cls_out.bias"),     "classifier.out_proj.bias"));
++        m.w_cd = decl_w(b, nm.f("cls_dense.weight"), RAD_BF16, {E, E}, A, N, grp_model());
++        m.b_cd = decl_w(b, nm.f("cls_dense.bias"),   RAD_F32, {E}, A, N, grp_model());
++        m.w_co = decl_w(b, nm.f("cls_out.weight"),   RAD_F32, {1, E}, A, N, grp_model());
++        m.b_co = decl_w(b, nm.f("cls_out.bias"),     RAD_F32, {1}, A, N, grp_model());
++        m.b_ct = decl_b(b, nm.f("cls_tanh"), RAD_BF16, {S, E});
++        m.b_cf = decl_b(b, nm.f("cls_f32"),  RAD_F32,  {S, E});
++        m.op_cd = rw(b, gemm_bias_op(S, E, E, m.w_cd, m.b_cd, "bf16", "tanh"), {m.b_cls}, {m.b_ct});
++        m.op_ct = rw(b, cast_op(S, E, "bf16", "f32"), {m.b_ct}, {m.b_cf});
++        m.op_co = rw(b, gemm_bias_op(S, 1, E, m.w_co, m.b_co, "f32", "none"), {m.b_cf},
++                     {m.b_pooled});
++        if (!m.op_cd || !m.op_ct || !m.op_co) return RAD_E_INVAL;
++    } else {
++        m.op_cast = rw(b, cast_op(S, E, "bf16", "f32"), {m.b_cls}, {m.b_pooled});
++        if (!m.op_cast) return RAD_E_INVAL;
++    }
++
++    /* The sparse logits reach the pooled row by position: lane_gather reads entry e's k-th row
++     * out of an iota table at e * width + k, which holds n_embd + e * width + k, so token t learns
++     * its element of the pooled buffer, and scatter_rows writes the logit there through a flat
++     * [max_seqs * width, 1] view. */
++    if (m.sparse) {
++        RAD_ARCH_TRY(map_copy(b, nm.f("sparse_linear.weight"), "sparse_linear.weight"));
++        RAD_ARCH_TRY(map_copy(b, nm.f("sparse_linear.bias"),   "sparse_linear.bias"));
++        m.w_sl = decl_w(b, nm.f("sparse_linear.weight"), RAD_BF16, {1, E}, A, N, grp_model());
++        m.b_sl = decl_w(b, nm.f("sparse_linear.bias"),   RAD_F32, {1}, A, N, grp_model());
++        m.b_sw   = decl_b(b, nm.f("sparse_logit"),     RAD_BF16, {T, 1});
++        m.b_swf  = decl_b(b, nm.f("sparse_logit_f32"), RAD_F32,  {T, 1});
++        m.b_lane = decl_b(b, nm.f("sparse_lane"),      RAD_I32,  {S});
++        m.b_tab  = decl_b(b, nm.f("sparse_tab"),       RAD_I32,  {S * m.width, 1});
++        m.b_sidx = decl_b(b, nm.f("sparse_idx"),       RAD_I32,  {T, 1});
++
++        auto iota_op = [&](int64_t rows, int64_t start) {
++            return RAD_OP(b, "iota",
++                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("start", start),
++                                     RAD_INT("step", 1)),
++                          RAD_NOWEIGHTS);
++        };
++        m.op_sl = rw(b, gemm_bias_op(T, 1, E, m.w_sl, m.b_sl, "bf16", "none"), {m.b_x}, {m.b_sw});
++        m.op_sl_cast = rw(b, cast_op(T, 1, "bf16", "f32"), {m.b_sw}, {m.b_swf});
++        m.op_lane = rw(b, iota_op(S, 0), {}, {m.b_lane});
++        m.op_tab = rw(b, iota_op(S * m.width, E), {}, {m.b_tab});
++        m.op_sidx = rw(b, RAD_OP(b, "lane_gather",
++                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", 1),
++                                            RAD_INT("stride", m.width), RAD_STR("dtype", "i32")),
++                                 RAD_NOWEIGHTS),
++                       {m.b_tab, m.b_lane}, {m.b_sidx});
++        m.op_zero = rw(b, RAD_OP(b, "fill",
++                                 RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", L),
++                                            RAD_STR("dtype", "f32")),
++                                 RAD_NOWEIGHTS),
++                       {}, {m.b_pooled});
++        m.op_scatter = rw(b, RAD_OP(b, "scatter_rows",
++                                    RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", 1),
++                                               RAD_STR("dtype", "f32")),
++                                    RAD_NOWEIGHTS),
++                          {m.b_swf, m.b_sidx}, {m.b_pooled});
++        if (!m.op_sl || !m.op_sl_cast || !m.op_lane || !m.op_tab || !m.op_sidx || !m.op_zero ||
++            !m.op_scatter)
++            return RAD_E_INVAL;
++    }
++
++    rad_note(b, "%s: %lld layers, hidden %lld, ffn %lld, %lld heads of %lld; post-norm, "
++                "absolute positions; pooled row %lld wide",
++             m.classifier ? "reranker" : m.sparse ? "BGE-M3 dense and sparse" : "embedding model",
++             (long long)g.n_layer, (long long)E, (long long)g.n_ff, (long long)g.n_head,
++             (long long)g.head_dim, (long long)m.width);
++    return RAD_OK;
++}
++
++static void step(RadCtx* c, const RadBatch* batch) {
++    const Model& m = g_model[rad_slot(c)];
++    const Geom& g = m.g;
++    const int64_t T = batch->n_tok, S = batch->n_seq, E = g.n_embd, L = g.max_ctx;
++    if (T <= 0 || S <= 0) return;
++    const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
++
++    RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_o, T));
++    RAD_ISSUE(c, m.op_pos, praw(batch->positions, RAD_I32, T), RAD_W(m.w_pos), brows(m.b_pe, T));
++    RAD_ISSUE(c, m.op_pos_add, brows(m.b_o, T), brows(m.b_pe, T), brows(m.b_o, T));
++    RAD_ISSUE(c, m.op_type, brows(m.b_o, T), RAD_W(m.w_type), brows(m.b_o, T));
++    RAD_ISSUE(c, m.op_emb_ln, brows(m.b_o, T), RAD_W(m.w_emb_ln), RAD_W(m.b_emb_ln),
++              brows(m.b_x, T));
++
++    for (const Layer& y : m.layers) {
++        RAD_ISSUE_N(c, y.op_qkv, T, brows(m.b_x, T), RAD_W(y.w_qkv), RAD_W(y.b_qkv), RAD_NONE,
++                    brows(m.b_qkv, T));
++        RAD_ISSUE(c, y.op_attn, bcol(m.b_qkv, 0, E, T), bcol(m.b_qkv, E, E, T),
++                  bcol(m.b_qkv, 2 * E, E, T), cu, brows(m.b_att, T));
++        RAD_ISSUE_N(c, y.op_out, T, brows(m.b_att, T), RAD_W(y.w_out), RAD_W(y.b_out),
++                    brows(m.b_x, T), brows(m.b_x, T));
++        RAD_ISSUE(c, y.op_norm1, brows(m.b_x, T), RAD_W(y.w_norm1), RAD_W(y.b_norm1),
++                  brows(m.b_h, T));
++        RAD_ISSUE_N(c, y.op_fc1, T, brows(m.b_h, T), RAD_W(y.w_fc1), RAD_W(y.b_fc1), RAD_NONE,
++                    brows(m.b_ff, T));
++        RAD_ISSUE_N(c, y.op_fc2, T, brows(m.b_ff, T), RAD_W(y.w_fc2), RAD_W(y.b_fc2),
++                    brows(m.b_h, T), brows(m.b_o, T));
++        RAD_ISSUE(c, y.op_norm2, brows(m.b_o, T), RAD_W(y.w_norm2), RAD_W(y.b_norm2),
++                  brows(m.b_x, T));
++    }
++
++    RAD_ISSUE_N(c, m.op_cls, S, brows(m.b_x, T), praw(batch->cu_seqlens, RAD_I32, S),
++                brows(m.b_cls, S));
++
++    if (m.classifier) {
++        RAD_ISSUE_N(c, m.op_cd, S, brows(m.b_cls, S), RAD_W(m.w_cd), RAD_W(m.b_cd), RAD_NONE,
++                    brows(m.b_ct, S));
++        RAD_ISSUE_N(c, m.op_ct, S, brows(m.b_ct, S), brows(m.b_cf, S));
++        RAD_ISSUE_N(c, m.op_co, S, brows(m.b_cf, S), RAD_W(m.w_co), RAD_W(m.b_co), RAD_NONE,
++                    brows(m.b_pooled, S));
++        return;
++    }
++    RAD_ISSUE_N(c, m.op_cast, S, brows(m.b_cls, S), bcol(m.b_pooled, 0, E, S));
++    if (!m.sparse) return;
++
++    RAD_ISSUE_N(c, m.op_sl, T, brows(m.b_x, T), RAD_W(m.w_sl), RAD_W(m.b_sl), RAD_NONE,
++                brows(m.b_sw, T));
++    RAD_ISSUE_N(c, m.op_sl_cast, T, brows(m.b_sw, T), brows(m.b_swf, T));
++    RAD_ISSUE_N(c, m.op_lane, S, brows(m.b_lane, S));
++    RAD_ISSUE_N(c, m.op_tab, S * m.width, brows(m.b_tab, S * m.width));
++    RAD_ISSUE_N(c, m.op_sidx, T, brows(m.b_tab, S * m.width), brows(m.b_lane, S), cu,
++                brows(m.b_sidx, T));
++    RAD_ISSUE_N(c, m.op_zero, S, bcol(m.b_pooled, E, L, S));
++    RAD_ISSUE_N(c, m.op_scatter, T, brows(m.b_swf, T), brows(m.b_sidx, T),
++                praw2(rad_buf_ptr(c, m.b_pooled), RAD_F32, S * m.width, 1));
++}
++
++}  /* namespace xlmroberta */
++
++#ifndef RAD_ARCH_NO_EXPORTS
++RAD_ARCH_MULTI_INSTANCE()
++RAD_ARCH_PLUGIN(xlmroberta, "xlmroberta", "", "0.1.0",
++                "XLM-RoBERTa (BGE-M3, BGE-reranker-v2-m3): a bidirectional post-norm encoder with "
++                "absolute positions, pooled to its first token, BGE-M3's sparse logits, or a "
++                "classifier's logit; bf16")
++RAD_ARCH_PROBE(xlmroberta)
++#endif
+diff --git a/core/format/checkpoint.cpp b/core/format/checkpoint.cpp
+index f02161b1d8..0a40b88a65 100644
+--- a/core/format/checkpoint.cpp
++++ b/core/format/checkpoint.cpp
+@@ -256,6 +256,7 @@
+         if (out->arch == "gemma4unified") out->arch = "gemma4";
+         /* Nemotron-H Omni wraps a Nemotron-H Puzzle text model (`llm_config`) the same way. */
+         if (out->arch == "nemotronhomni") out->arch = "nemotronh";
++        if (out->arch == "xlm-roberta") out->arch = "xlmroberta";
+     }
+     if (const char* nm = gs("_name_or_path")) out->name = nm;
+ 
+@@ -293,7 +294,8 @@
+     m.n_expert_used   = gi("num_experts_per_tok", gi("moe_top_k", 0));
+     m.n_expert_shared = gi("n_shared_experts", gi("num_shared_experts",
+                            gi("shared_expert_intermediate_size", 0) ? 1 : 0));
+-    m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", gf("layer_norm_epsilon", 1e-6)));
++    m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", gf("layer_norm_epsilon",
++                              gf("layer_norm_eps", 1e-6))));
+     m.rope_theta  = (float)gf("rope_parameters.rope_theta",
+                               gf("rope_theta", gf("rotary_emb_base", 10000.0)));
+     /* Rotary scaling stays in the free-form keys with its type (arch/common/rad_arch.h,
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+index ca0b942327..b146fca3b5 100644
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -286,7 +286,7 @@
+ const char* kAcceptedCompletion[] = { "prompt", "echo", "preserved_tokens" };
+ 
+ const char* kAcceptedEmbedding[] = { "model", "input", "messages", "encoding_format",
+-                                      "dimensions", "image_tokens", "prompt_name" };
++                                      "dimensions", "image_tokens", "prompt_name", "normalize" };
+ 
+ /* Listed explicitly so ignoring them is a recorded decision, and the debug line of ignored names
+  * shows only undecided fields. */
+@@ -2649,6 +2649,7 @@
+         return RAD_E_INVAL;
+     }
+     out->base64_embeddings = (enc == "base64");
++    if (!get_bool(b, "normalize", &out->normalize, err)) return RAD_E_INVAL;
+ 
+     if (b.contains("dimensions") && !b.at("dimensions").is_null()) {
+         const json& dv = b.at("dimensions");
+diff --git a/core/server/oai.h b/core/server/oai.h
+index 6d5b049c8a..235369ddbc 100644
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -157,6 +157,9 @@
+     /* OpenAI's `dimensions`: the vector's first `dimensions` components, renormalised (a
+      * Matryoshka-trained model's shorter embedding). 0 is the model's own width. */
+     int64_t dimensions = 0;
++    /* vLLM's `normalize`: false returns the pooled row as the model wrote it, for a model whose
++     * row is not one vector (BGE-M3's dense and sparse parts). */
++    bool normalize = true;
+     /* /v1/embeddings: a soft-token budget for the request's images, 0 the server's. */
+     int32_t image_tokens = 0;
+     /* /rerank: original document order is retained through scheduler batching. */
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+index 64556c7a5b..5ab77d52df 100644
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1874,7 +1874,7 @@
+                 return error_response(err_internal("the reranker returned a non-finite score"),
+                                       req.peer);
+             }
+-        } else {
++        } else if (r.normalize) {
+             double ss = 0.0;
+             for (float x : out)
+                 ss += (double)x * x;
+diff --git a/data/recipes/bge-m3-bf16.recipe b/data/recipes/bge-m3-bf16.recipe
+new file mode 100644
+index 0000000000..372a7876d7
+--- /dev/null
++++ b/data/recipes/bge-m3-bf16.recipe
+@@ -0,0 +1,19 @@
++# bge-m3-bf16.recipe -- BGE-M3 from the HF checkpoint, dense and sparse, as the xlmroberta plugin
++# serves it.
++#
++#   rad-convert /data --recipe data/recipes/bge-m3-bf16.recipe --set sparse_linear=1 -o bge-m3.rad
++#
++# The checkpoint ships only pytorch_model.bin, which rad-convert passes over, so /data holds the
++# same tensors as model.safetensors. sparse_linear.pt goes beside it renamed sparse_linear.pth.
++# The plugin runs the linears and the tables in bf16 and keeps norms and biases f32; the sparse
++# head is stored f16 and is cast like the rest.
++
++token_embd.weight             cast  dtype=bf16
++position_embd.weight          cast  dtype=bf16
++token_type.weight             cast  dtype=bf16
++blk.*.attn_qkv.weight         cast  dtype=bf16
++blk.*.attn_out.weight         cast  dtype=bf16
++blk.*.ffn_fc1.weight          cast  dtype=bf16
++blk.*.ffn_fc2.weight          cast  dtype=bf16
++sparse_linear.weight          cast  dtype=bf16
++sparse_linear.bias            cast  dtype=f32
+diff --git a/data/recipes/bge-reranker-v2-m3-bf16.recipe b/data/recipes/bge-reranker-v2-m3-bf16.recipe
+new file mode 100644
+index 0000000000..06870abf4e
+--- /dev/null
++++ b/data/recipes/bge-reranker-v2-m3-bf16.recipe
+@@ -0,0 +1,16 @@
++# bge-reranker-v2-m3-bf16.recipe -- BGE-reranker-v2-m3 from the HF checkpoint, as the xlmroberta
++# plugin serves it.
++#
++#   rad-convert /data --recipe data/recipes/bge-reranker-v2-m3-bf16.recipe -o bge-reranker.rad
++#
++# The encoder and the classifier's dense layer run in bf16. out_proj stays f32: the logit is
++# computed in f32 from the tanh row widened to f32.
++
++token_embd.weight             cast  dtype=bf16
++position_embd.weight          cast  dtype=bf16
++token_type.weight             cast  dtype=bf16
++blk.*.attn_qkv.weight         cast  dtype=bf16
++blk.*.attn_out.weight         cast  dtype=bf16
++blk.*.ffn_fc1.weight          cast  dtype=bf16
++blk.*.ffn_fc2.weight          cast  dtype=bf16
++cls_dense.weight              cast  dtype=bf16
+diff --git a/docs/ARCHITECTURES.md b/docs/ARCHITECTURES.md
+index 65dec24587..3e0289176f 100644
+--- a/docs/ARCHITECTURES.md
++++ b/docs/ARCHITECTURES.md
+@@ -34,6 +34,7 @@
+ | `arch/spark25_w8a8` | `spark25` | `w8a8_fwht128` | the same with rotated int8 weights and activations (`data/recipes/spark-x26-4b-iq8r.recipe`); an optional DSpark drafter stays bf16 |
+ | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
+ | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
++| `arch/xlmroberta` | `xlmroberta` | *(empty)* | XLM-RoBERTa (BGE-M3, BGE-reranker-v2-m3): a bidirectional post-norm encoder with absolute positions, pooled to its first token, with BGE-M3's sparse logits or a classifier's logit ([geometry](#xlmroberta-bge-m3-and-its-reranker)) |
+ | `arch/laya` | `laya` | *(empty)* | Convai Innovations' Laya decision models (laya, laya-typed-decisions, laya-multilingual): a ModernBERT encoder and a small decision head scoring each option of a question, bf16, served on `/v1/systemone` |
+ | `arch/unlimitedocr_bf16` | `unlimitedocr` | *(empty)* | baidu's Unlimited-OCR: a small Llama-MoE decoder with the DeepEncoder vision tower (SAM ViT-B/16, CLIP ViT-L/14 and a projector), bf16 |
+ | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
+@@ -1394,6 +1395,45 @@
+ 
+ ---
+ 
++# `xlmroberta`: BGE-M3 and its reranker
++
++`arch/xlmroberta` is an embedding program like `nomicbert`: a pooled output, no sampler, no KV
++cache, one step an input. One card (`tp: 1`).
++
++```
++text      24 layers, hidden 1024, ffn 4096, vocab 250002, 16 heads of 64, type vocab 1
++          trained to 8194 positions, the first two of them padding_idx's
++          post-norm block: a = out(attn(Wqkv h + b)) + b_out; h = LN1(h + a)
++          dense MLP, fc2(gelu(fc1 h + b1)) + b2, exact gelu; h = LN2(h + m)
++          query, key and value fused [q|k|v] at convert time, non-causal, scale 0.125
++          embeddings: word + position (rows from 2 on) + token_type, then LayerNorm
++```
++
++The pooled row is chosen by the checkpoint. `XLMRobertaModel` returns the `<s>` row, 1024 wide.
++With `--set sparse_linear=1` and BGE-M3's `sparse_linear.pt` beside the checkpoint renamed
++`sparse_linear.pth`, the row continues with the sparse logit of each position, `max-model-len`
++of them, zero past the input: 1024 + 512 wide at `max-model-len: 512`. The logits are before
++BGE-M3's relu, and the client takes the positive ones and the maximum per token id, so it
++tokenises the input and sends the ids. `XLMRobertaForSequenceClassification` returns
++`out_proj(tanh(dense(<s>)))`, one f32 logit; `out_proj` runs in f32 because a bf16 logit near 8
++is rounded to a multiple of 1/16.
++
++Neither row is a unit vector, so a request sets `"normalize": false` on `/v1/embeddings`. The
++reranker reads a pair as the client builds it, `<s> query </s></s> document </s>`; `/rerank`
++formats Nemotron's pairs only.
++
++```sh
++rad-convert <bge-m3 dir> --recipe data/recipes/bge-m3-bf16.recipe --set sparse_linear=1 \
++    -o bge-m3-bf16.rad
++rad-convert <bge-reranker-v2-m3 dir> --recipe data/recipes/bge-reranker-v2-m3-bf16.recipe \
++    -o bge-reranker-v2-m3-bf16.rad
++```
++
++BGE-M3 ships only `pytorch_model.bin`, which rad-convert passes over, so its directory needs the
++same tensors as `model.safetensors`.
++
++---
++
+ # `gemma4`: Gemma 4 text and its DFlash drafter
+ 
+ `arch/gemma4` serves a container converted from Google's bf16 checkpoint
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 0b66e7f4ca..bfb7893c2d 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -319,6 +319,7 @@
+ | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
+ | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
+ | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
++| `xlmroberta` | BGE-M3 (dense and sparse) and BGE-reranker-v2-m3, embedding models (§5.6) |
+ | `nemotron35_embed` | Nemotron 3.5 Embed 1B/8B and Rerank 8B, BF16 text/image retrieval at TP1 (§5.6) |
+ | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
+ | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
+diff --git a/docs/OPS.md b/docs/OPS.md
+index d9cef5c4c5..d32f042983 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -861,7 +861,7 @@
+ leave them out and rad-avx-check builds them by hand.
+ 
+ `gemm_nt_bias`'s epilogue is a linear layer's: the biased product rounded to `y`'s dtype, then
+-`act` of it (`none`, `gelu` exact, `gelu_tanh`) rounded, then `res` added and rounded. Each step is
++`act` of it (`none`, `gelu` exact, `gelu_tanh`, `tanh`) rounded, then `res` added and rounded. Each step is
+ what a separate tensor would hold, so the fused form equals the unfused chain bit for bit. `res`
+ may be `y` itself, the residual stream updated in place (the encoder towers' layers do this), so an
+ implementation reads `res` before it stores the product over it.
+diff --git a/libavx/avx_cases.cpp b/libavx/avx_cases.cpp
+index fd40a5cff5..d8682f498b 100644
+--- a/libavx/avx_cases.cpp
++++ b/libavx/avx_cases.cpp
+@@ -281,7 +281,7 @@
+             add("gemm_nt",      { HI("M", M), HI("N", 96), HI("K", 259), HS("dtype", dt) }, 0, fl);
+             add("gemm_nt_bias", { HI("M", M), HI("N", 96), HI("K", 259), HS("dtype", dt) }, 0, fl);
+             if (M == 7)
+-                for (const char* act : { "none", "gelu", "gelu_tanh" })
++                for (const char* act : { "none", "gelu", "gelu_tanh", "tanh" })
+                     add("gemm_nt_bias", { HI("M", M), HI("N", 96), HI("K", 259), HS("dtype", dt),
+                                           HS("act", act) }, 0, fl);
+             add("logits_gemm",  { HI("M", M), HI("n_vocab", 96), HI("n_embd", 259),
+diff --git a/libavx/avx_gemm.cpp b/libavx/avx_gemm.cpp
+index 41747313b3..581ed26c79 100644
+--- a/libavx/avx_gemm.cpp
++++ b/libavx/avx_gemm.cpp
+@@ -313,6 +313,8 @@
+             else if (act == 2) {
+                 v = 0.5f * v * (1.0f + sc_tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+                 stt(Y, o, v);
++            } else if (act == 3) {
++                stt(Y, o, sc_tanh(v));
+             }
+             if (res) stt(Y, o, ldt(res, m * rr + n * rs) + ldt(Y, o));
+         }
+@@ -361,9 +363,9 @@
+     const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[nt - 1];
+     const RadTensor* bias = bias_operand ? rad_arg_in(a, 2) : nullptr;
+     const RadTensor* res  = bias_operand ? rad_arg_in(a, 3) : nullptr;
+-    static const char* kActs[] = { "none", "gelu", "gelu_tanh" };
+-    const int act = bias_operand ? p_enum(a, "act", kActs, 3, 0) : 0;
+-    if (act < 0 || act > 2) return RAD_E_INVAL;
++    static const char* kActs[] = { "none", "gelu", "gelu_tanh", "tanh" };
++    const int act = bias_operand ? p_enum(a, "act", kActs, 4, 0) : 0;
++    if (act < 0 || act > 3) return RAD_E_INVAL;
+ 
+     const int64_t K = p_int(a, kkey, B->rank >= 2 ? B->shape[B->rank - 1] : 0);
+     const int64_t N = p_int(a, nkey, B->rank >= 2 ? B->shape[B->rank - 2] : 0);
+diff --git a/libr4d/r4d_gemm_f32_nt_bias.hip b/libr4d/r4d_gemm_f32_nt_bias.hip
+index 79c88ae65a..bd48bd3564 100644
+--- a/libr4d/r4d_gemm_f32_nt_bias.hip
++++ b/libr4d/r4d_gemm_f32_nt_bias.hip
+@@ -79,6 +79,7 @@
+             float t = rd(C, v[e] + bc[g * CW + e]);
+             if (act == 1) t = rd(C, gelu_erf(t));
+             else if (act == 2) t = rd(C, gelu_tanh(t));
++            else if (act == 3) t = rd(C, tanhf(t));
+             if (R && n + e < N) t = ld1(R + (size_t)m * ldr + n + e) + t;
+             v[e] = t;
+         }
+@@ -133,6 +134,7 @@
+     if (act_s && *act_s) {
+         if (!std::strcmp(act_s, "gelu")) act = 1;
+         else if (!std::strcmp(act_s, "gelu_tanh")) act = 2;
++        else if (!std::strcmp(act_s, "tanh")) act = 3;
+         else if (std::strcmp(act_s, "none")) return R4D_NO(RAD_E_SCHEMA);
+     }
+     const int bias_f32 = B && B->dtype == RAD_F32;
+diff --git a/libr4d/r4d_model_bf16.hip b/libr4d/r4d_model_bf16.hip
+index 72a26f633e..9e9f2fb92f 100644
+--- a/libr4d/r4d_model_bf16.hip
++++ b/libr4d/r4d_model_bf16.hip
+@@ -1916,6 +1916,29 @@
+                                 stream) == 0 ? RAD_OK : RAD_E_DEVICE;
+ }
+ 
++/* And for f32 rows, at four bytes an element: any n, a row of one included. */
++extern "C" int r4d_rad_scatter_rows_f32(const RadArgs* a, RadStream stream) {
++    const RadTensor* v   = r4d_opt(a, SR_V);
++    const RadTensor* idx = r4d_opt(a, SR_IDX);
++    const RadTensor* x   = r4d_opt(a, SR_X);
++    if (!v || !idx || !x) return R4D_NO(RAD_E_INVAL);
++    if (v->dtype != RAD_F32 || x->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
++    R4D_NEED(dt_i32(idx));
++    if (!r4d_contig(idx)) return R4D_NO(RAD_E_STRIDE);
++
++    const long long n = r4d_geti_or(a, "n", r4d_dim(v, (int)v->rank - 1));
++    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
++    long long M = 0, dst = 0;
++    const long long v_ld = r4d_rows_pitch(v, n, &M);
++    const long long x_ld = r4d_rows_pitch(x, n, &dst);
++    if (v_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
++    if (M <= 0 || dst <= 0 || r4d_numel(idx) < M) return R4D_NO(RAD_E_SHAPE);
++
++    return scatter_rows_u8_emit(r4d_addr(v), r4d_addr(idx), r4d_addr(x),
++                                (int)M, (int)(4 * n), (int)dst, (int)(4 * v_ld), (int)(4 * x_ld),
++                                stream) == 0 ? RAD_OK : RAD_E_DEVICE;
++}
++
+ /* ------------------------------------------------------------------ cast (bf16 -> bf16) */
+ /* A strided row copy, which is what `cast` reduces to when both ends are the same dtype. A
+  * drafter conditioned on the trunk's intermediate hidden states must copy rows out of the residual
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 9dba0c58d6..37ae0f18c9 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -818,6 +818,7 @@
+ int r4d_rad_gather_rows_u8  (const RadArgs*, RadStream);
+ int r4d_rad_scatter_rows_u8 (const RadArgs*, RadStream);
+ int r4d_rad_scatter_rows_bf16(const RadArgs*, RadStream);
++int r4d_rad_scatter_rows_f32(const RadArgs*, RadStream);
+ int r4d_rad_rmsnorm         (const RadArgs*, RadStream);
+ /* The same row choosing the short-row form when it serves (`rmsnorm_rows`, rmsnorm_short_kernel). */
+ int r4d_rad_rmsnorm_rows    (const RadArgs*, RadStream);
+@@ -959,6 +960,7 @@
+ int r4d_shape_binary         (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_mul_weight     (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*);
++int r4d_shape_scatter_rows_f32(const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_grid_embed_cpe (const RadParam*, int, int operand, RadOpdDesc*);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 673b43360c..7f61b25356 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -6010,8 +6010,9 @@
+ static const RadConstraint cLnModHq[] = { C_IN("dtype", "bf16"), C_DIV("n", 128), C_LE("n", 8192),
+                                           C_GE("group", 128), C_LE("group", 256),
+                                           C_DIV("group", 128) };
+-/* The lane copies move 32-bit words, so any row of whole words: bf16 latents and an f32 mask. */
+-static const RadConstraint cGenLanes[] = { C_IN("dtype", "bf16 f32") };
++/* The lane copies move 32-bit words, so any row of whole words: bf16 latents, an f32 mask and
++ * i32 indices. */
++static const RadConstraint cGenLanes[] = { C_IN("dtype", "bf16 f32 i32") };
+ /* gelu_quick: x and y of one dtype, any width and pitch. */
+ static const RadConstraint cGeluQuick[] = { C_IN("dtype", "bf16 f32") };
+ /* The two lists are kernel arguments, 64 floats each at most (r4d_gen.hip). */
+@@ -6218,6 +6219,15 @@
+   nullptr, nullptr, r4d_rad_scatter_rows_bf16, nullptr, nullptr, nullptr,
+   r4d_shape_scatter_rows_bf16 },
+ 
++{ "scatter_rows_f32", "scatter_rows", "elem",
++  "x[idx[i], :] = v[i, :] for f32 rows -- the u8 row's byte copy at four times the width",
++  "any n; distinct indices; the destination pitch is read off the operand",
++  "i32 indices, f32 rows",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cF32Row), NOTUNE,
++  nullptr, nullptr, r4d_rad_scatter_rows_f32, nullptr, nullptr, nullptr,
++  r4d_shape_scatter_rows_f32 },
++
+ { "cast_bf16_bf16", "cast", "elem",
+   "y = x, bf16 to bf16 -- a strided row copy through libr4d's 2D copy",
+   "any M and n; both row pitches are read off the operands, so a COLUMN SLICE of a wider "
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 2745115434..5a7c0f0cc4 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -6133,7 +6133,7 @@
+                               bool res, bool bias_f32) {
+     if (!sel("gemm_bf16_nt_bias_tiled")) return;
+     char nm[192];
+-    static const char* acts[] = { "none", "gelu", "gelu_tanh" };
++    static const char* acts[] = { "none", "gelu", "gelu_tanh", "tanh" };
+     std::snprintf(nm, sizeof nm, "gemm_bf16_nt_bias_tiled numeric M=%lld N=%lld K=%lld act=%s%s%s",
+                   (long long)M, (long long)N, (long long)K, acts[act], res ? " res=out" : "",
+                   bias_f32 ? "" : " bias=bf16");
+@@ -6192,6 +6192,7 @@
+             if (act == 1) t = h_bf16(h_to_bf16((float)(0.5 * t * (1.0 + std::erf(t * 0.70710678118654752)))));
+             if (act == 2) t = h_bf16(h_to_bf16((float)(0.5 * t * (1.0 + std::tanh(0.7978845608028654 *
+                                                                             (t + 0.044715 * t * t * t))))));
++            if (act == 3) t = h_bf16(h_to_bf16((float)std::tanh(t)));
+             /* A step of the product before the residual add carries through it unchanged, so the
+              * bound scales with the larger of the two. */
+             const float u = t;
+@@ -31940,6 +31941,7 @@
+         bias_gemm_numeric(pl, 1100, 1001, 200, 1, true, false);
+         bias_gemm_numeric(pl, 520, 1040, 1104, 0, true, true);
+         bias_gemm_numeric(pl, 2050, 600, 40, 2, false, true);
++        bias_gemm_numeric(pl, 64, 1024, 1024, 3, false, false);
+         bias_gemm_numeric(pl, 200, 300, 136, 2, true, false);
+         i8a8h_rot(pl, "gemm_i8a8_nt_m16", 1, 256, 1024);
+         i8a8h_rot(pl, "gemm_i8a8_nt_m16", 16, 256, 1024);
+diff --git a/libr4d/r4d_shapes.cpp b/libr4d/r4d_shapes.cpp
+index dae28d4432..69bfb8fa1f 100644
+--- a/libr4d/r4d_shapes.cpp
++++ b/libr4d/r4d_shapes.cpp
+@@ -311,6 +311,18 @@
+     R4D_PICK(l);
+ }
+ 
++extern "C" int r4d_shape_scatter_rows_f32(const RadParam* p, int n_p, int operand,
++                                          RadOpdDesc* out) {
++    const int64_t M = pi(p, n_p, "M");
++    const int64_t n = pi(p, n_p, "n");
++    const RadOpdDesc l[] = {
++        opd((uint32_t)RAD_F32, M, n),
++        opd_idx(M, 0, 4 * M, -1, RAD_OPD_F_IDX_UNIQUE),
++        opd((uint32_t)RAD_F32, 4 * M, n),
++    };
++    R4D_PICK(l);
++}
++
+ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
+                               RadOpdDesc* out) {
+ 
+diff --git a/libr4d/r4d_vit_bf16.hip b/libr4d/r4d_vit_bf16.hip
+index 7d5efdc87b..c06da717f8 100644
+--- a/libr4d/r4d_vit_bf16.hip
++++ b/libr4d/r4d_vit_bf16.hip
+@@ -330,6 +330,7 @@
+                 unsigned short t = f32_to_bf16(acc[i][j][e] + bv);
+                 if constexpr (ACT == 1) t = f32_to_bf16(gelu_erf(bf2f(t)));
+                 if constexpr (ACT == 2) t = f32_to_bf16(gelu_tanh(bf2f(t)));
++                if constexpr (ACT == 3) t = f32_to_bf16(tanhf(bf2f(t)));
+                 if constexpr (RES) t = f32_to_bf16(bf2f(R[(size_t)m * ldr + n]) + bf2f(t));
+                 C[(size_t)m * ldc + n] = t;
+             }
+@@ -393,6 +394,7 @@
+     unsigned short t = f32_to_bf16(acc + bv);
+     if constexpr (ACT == 1) t = f32_to_bf16(gelu_erf(bf2f(t)));
+     if constexpr (ACT == 2) t = f32_to_bf16(gelu_tanh(bf2f(t)));
++    if constexpr (ACT == 3) t = f32_to_bf16(tanhf(bf2f(t)));
+     if constexpr (RES) t = f32_to_bf16(bf2f(r) + bf2f(t));
+     return t;
+ }
+@@ -741,6 +743,7 @@
+     if (act_s && *act_s) {
+         if (!std::strcmp(act_s, "gelu")) act = 1;
+         else if (!std::strcmp(act_s, "gelu_tanh")) act = 2;
++        else if (!std::strcmp(act_s, "tanh")) act = 3;
+         else if (std::strcmp(act_s, "none")) return R4D_NO(RAD_E_SCHEMA);
+     }
+     const bool res = R != nullptr, bf32 = B->dtype == RAD_F32;
+@@ -767,6 +770,7 @@
+         do {                                                                                      \
+             if (act == 1) VB_L(1, RS, BF);                                                        \
+             if (act == 2) VB_L(2, RS, BF);                                                        \
++            if (act == 3) VB_L(3, RS, BF);                                                        \
+             VB_L(0, RS, BF);                                                                      \
+         } while (0)
+ #define VB_RES(BF)                                                                                \
+@@ -786,6 +790,7 @@
+     do {                                                                                          \
+         if (act == 1) VB_L(1, RS, BF);                                                            \
+         if (act == 2) VB_L(2, RS, BF);                                                            \
++        if (act == 3) VB_L(3, RS, BF);                                                            \
+         VB_L(0, RS, BF);                                                                          \
+     } while (0)
+ #define VB_RES(BF)                                                                                \
+diff --git a/libref/ref_gemm.cpp b/libref/ref_gemm.cpp
+index 673a21e6a0..479d82c9bc 100644
+--- a/libref/ref_gemm.cpp
++++ b/libref/ref_gemm.cpp
+@@ -156,6 +156,7 @@
+             const int64_t o = m * ys_r + n * ys_c;
+             if (act == 1) stt(Y, o, act_gelu(ldt(Y, o)));
+             else if (act == 2) stt(Y, o, act_gelu_tanh(ldt(Y, o)));
++            else if (act == 3) stt(Y, o, std::tanh(ldt(Y, o)));
+             if (res) stt(Y, o, ldt(res, m * rs_r + n * rs_c) + ldt(Y, o));
+         }
+ }
+@@ -241,9 +242,9 @@
+     const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[nt - 1];
+     const RadTensor* bias = bias_operand ? t_in(a, 2) : nullptr;
+     const RadTensor* res  = bias_operand ? t_in(a, 3) : nullptr;
+-    static const char* kActs[] = { "none", "gelu", "gelu_tanh" };
+-    const int act = bias_operand ? p_enum(a, "act", kActs, 3, 0) : 0;
+-    if (act < 0 || act > 2) return RAD_E_INVAL;
++    static const char* kActs[] = { "none", "gelu", "gelu_tanh", "tanh" };
++    const int act = bias_operand ? p_enum(a, "act", kActs, 4, 0) : 0;
++    if (act < 0 || act > 3) return RAD_E_INVAL;
+ 
+     const int64_t K = p_int(a, kkey, B->rank >= 2 ? B->shape[B->rank - 1] : 0);
+     const int64_t N = p_int(a, nkey, B->rank >= 2 ? B->shape[B->rank - 2] : 0);
+diff --git a/tests/shipped_plugins_test.cpp b/tests/shipped_plugins_test.cpp
+index 8e01fecc4c..9be863c646 100644
+--- a/tests/shipped_plugins_test.cpp
++++ b/tests/shipped_plugins_test.cpp
+@@ -108,7 +108,7 @@
+         { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
+         { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" },
+         { "spark25", "" }, { "spark25", "w8a8_fwht128" }, { "sdxl", "" },
+-        { "unlimitedocr", "" } };
++        { "unlimitedocr", "" }, { "xlmroberta", "" } };
+     std::set<std::pair<std::string, std::string>> got;
+     for (const auto& [k, name] : keys) got.insert(k);
+     if (got != want)

@@ -96,6 +96,7 @@ stdenv.mkDerivation {
   patches = [
     ./patches/drafter-window-snapshot.patch
     ./patches/core-no-offload-compress.patch
+    ./patches/xlmroberta.patch
   ];
 
   nativeBuildInputs = [
