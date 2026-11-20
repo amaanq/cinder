@@ -8,7 +8,7 @@ diff -ru a/core/engine.h b/core/engine.h
 -     * where the trunk's window is snapshotted at all (window_snapshots): a full-attention trunk
 -     * takes no snapshot for a drafter's window alone. */
 +     * where a snapshot is taken at all, for the trunk's window (window_snapshots) or for linear
-+     * state (linear_checkpoints): a full-attention trunk takes no snapshot for a drafter's window
++     * state (linear_checkpoints). A full-attention trunk takes no snapshot for a drafter's window
 +     * alone. */
      bool drafter_window_snap(const Program& p) const {
          return cfg_.n_spec > 0 && p.drafter.kind == RAD_DRAFT_BLOCK && p.drafter.depth > 0 &&
@@ -86,7 +86,7 @@ diff -ru a/core/sched/geometry.h b/core/sched/geometry.h
   * reporting the geometry: a trunk's sliding window, no linear state, a prefix cache and an
   * interval. Bring-up asks it before the geometry is resolved (Engine::drafter_window_snap). */
  bool window_snapshots(const Program& prog, const Config& cfg);
-+/* The same for a model with linear state: its checkpoints under a prefix cache and an interval. */
++/* The same for a model with linear state, its checkpoints under a prefix cache and an interval. */
 +bool linear_checkpoints(const Program& prog, const Config& cfg);
  
  /* Resolve the geometry from the declared program and the operator's budgets.

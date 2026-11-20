@@ -1,13 +1,12 @@
 diff -ru a/core/CMakeLists.txt b/core/CMakeLists.txt
 --- a/core/CMakeLists.txt
 +++ b/core/CMakeLists.txt
-@@ -117,6 +117,11 @@
+@@ -117,6 +117,10 @@
        gfx9-generic gfx9-4-generic gfx10-1-generic gfx10-3-generic gfx11-generic gfx12-generic)
    list(REMOVE_DUPLICATES RAD_CORE_GPU_TARGETS)
    set_target_properties(rad_core PROPERTIES HIP_ARCHITECTURES "${RAD_CORE_GPU_TARGETS}")
-+  # As rad_hipify does for a plugin: a toolchain that compresses offload bundles by default
-+  # (nixpkgs' ROCm clang) would otherwise give the core kernels a fat binary the AQL backend
-+  # rejects at first launch.
++  # rad_hipify adds this for plugins. nixpkgs' ROCm clang compresses offload bundles by default,
++  # giving the core a fat binary the AQL backend rejects at first launch.
 +  target_compile_options(rad_core PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--no-offload-compress>)
 +  target_link_options(rad_core PRIVATE $<$<LINK_LANGUAGE:HIP>:--no-offload-compress>)
    rad_hip_repeatable(rad_core)

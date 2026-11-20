@@ -19,8 +19,8 @@ stdenv.mkDerivation {
     hash = "sha256-WkgJF0D4XsrWKbJO+vKow9CrNIKL/PqOXRwrB3ECsQE=";
   };
 
-  # Without this LLVM 24 pairs VOPD instructions differently from one compile
-  # to the next, and radiance turns pairing off for an unpatched compiler.
+  # Without this, LLVM 24 pairs VOPD instructions differently from compile to
+  # compile, so radiance turns pairing off for an unpatched compiler.
   patches = [ ./patches/llvm-vopd-pairing.patch ];
 
   nativeBuildInputs = [

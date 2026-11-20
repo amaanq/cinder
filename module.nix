@@ -99,7 +99,7 @@ in
         StateDirectory = "radiance";
         LimitMEMLOCK = "infinity";
         Restart = "on-failure";
-        # The server finishes the step in flight and releases the cards on SIGTERM.
+        # On SIGTERM the server finishes the in-flight step and releases the cards.
         TimeoutStopSec = 60;
       };
     };

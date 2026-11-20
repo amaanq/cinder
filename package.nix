@@ -18,9 +18,8 @@
 let
   inherit (stdenv.cc) cc libc;
 
-  # The kernels are tuned against ROCm 10.1's LLVM 24. LLVM 22 from nixpkgs'
-  # ROCm 7.2 spills registers in 674 of them against 341, and prefill
-  # attention runs 1.45x slower.
+  # nixpkgs' ROCm 7.2 ships LLVM 22, which spills registers in 674 kernels
+  # versus 341 under LLVM 24, and prefill attention runs 1.45x slower.
   # hip-lang's CMake config links with --rtlib=compiler-rt.
   resourceDir = runCommand "radiance-hip-resource-dir" { } ''
     mkdir -p $out/lib/${stdenv.hostPlatform.config}
@@ -40,9 +39,8 @@ let
     hash = "sha256-esRSLaydv+bGg6h+z1DZUK7KA2ayVLtweeLKnj88z/s=";
   };
 
-  # clang 24's HIP wrapper headers do not compile nixpkgs' HIP 7.2 headers, so
-  # this is a ROCm root with 10.1's headers over nixpkgs' runtime. Both are
-  # HIP major 7.
+  # clang 24's HIP wrapper headers do not compile with nixpkgs' HIP 7.2 headers.
+  # This root pairs 10.1's HIP headers with nixpkgs' runtime. Both are HIP major 7.
   hipRoot = runCommand "radiance-hip-root" { } ''
     mkdir -p $out/bin $out/include $out/lib/cmake
     cp -r ${rocmSystems}/projects/hip/include/hip $out/include/hip
