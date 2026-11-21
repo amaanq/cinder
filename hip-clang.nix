@@ -41,19 +41,19 @@ stdenv.mkDerivation {
   '';
 
   cmakeFlags = [
-    (lib.cmakeFeature "LLVM_ENABLE_PROJECTS" "clang;lld")
-    (lib.cmakeFeature "LLVM_TARGETS_TO_BUILD" "AMDGPU;X86")
-    (lib.cmakeFeature "LLVM_EXTERNAL_PROJECTS" "device-libs")
-    (lib.cmakeBool "LLVM_ENABLE_ASSERTIONS" false)
-    (lib.cmakeBool "LLVM_INCLUDE_TESTS" false)
-    (lib.cmakeBool "LLVM_INCLUDE_BENCHMARKS" false)
-    (lib.cmakeBool "LLVM_INCLUDE_EXAMPLES" false)
-    (lib.cmakeBool "LLVM_INCLUDE_DOCS" false)
-    (lib.cmakeBool "CLANG_INCLUDE_TESTS" false)
-    (lib.cmakeBool "CLANG_ENABLE_STATIC_ANALYZER" false)
-    (lib.cmakeBool "CLANG_ENABLE_ARCMT" false)
-    (lib.cmakeFeature "LLVM_FORCE_VC_REVISION" "d6f6cb691863e9258034ab48c1dfce21689d5606")
-    (lib.cmakeFeature "LLVM_FORCE_VC_REPOSITORY" "https://github.com/ROCm/llvm-project.git")
+    (lib.cmakeFeature "LLVM_ENABLE_PROJECTS"         "clang;lld")
+    (lib.cmakeFeature "LLVM_TARGETS_TO_BUILD"        "AMDGPU;X86")
+    (lib.cmakeFeature "LLVM_EXTERNAL_PROJECTS"       "device-libs")
+    (lib.cmakeBool    "LLVM_ENABLE_ASSERTIONS"       false)
+    (lib.cmakeBool    "LLVM_INCLUDE_TESTS"           false)
+    (lib.cmakeBool    "LLVM_INCLUDE_BENCHMARKS"      false)
+    (lib.cmakeBool    "LLVM_INCLUDE_EXAMPLES"        false)
+    (lib.cmakeBool    "LLVM_INCLUDE_DOCS"            false)
+    (lib.cmakeBool    "CLANG_INCLUDE_TESTS"          false)
+    (lib.cmakeBool    "CLANG_ENABLE_STATIC_ANALYZER" false)
+    (lib.cmakeBool    "CLANG_ENABLE_ARCMT"           false)
+    (lib.cmakeFeature "LLVM_FORCE_VC_REVISION"       "d6f6cb691863e9258034ab48c1dfce21689d5606")
+    (lib.cmakeFeature "LLVM_FORCE_VC_REPOSITORY"     "https://github.com/ROCm/llvm-project.git")
   ];
 
   meta = {

@@ -41,7 +41,7 @@ let
 
   # clang 24's HIP wrapper headers do not compile with nixpkgs' HIP 7.2 headers.
   # This root pairs 10.1's HIP headers with nixpkgs' runtime. Both are HIP major 7.
-  hipRoot = runCommand "radiance-hip-root" { } ''
+  hipRoot = runCommand "radiance-hip-root" { } /* sh */ ''
     mkdir -p $out/bin $out/include $out/lib/cmake
     cp -r ${rocmSystems}/projects/hip/include/hip $out/include/hip
     chmod -R u+w $out/include
