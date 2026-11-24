@@ -1,0 +1,174 @@
+--- a/core/server/admin.cpp
++++ b/core/server/admin.cpp
+@@ -263,6 +263,11 @@
+  * per-slot state. n_ctx is the context one request may use (llama-server's per-slot n_ctx);
+  * omitted when the context length is unknown. */
+ HttpResponse Server::handle_props(const HttpRequest&) {
++    metrics_.observe_http(200);
++    return HttpResponse::json_body(200, props_json());
++}
++
++std::string Server::props_json() const {
+     const SamplingParams& sp = opt_.default_sampling;
+     /* Every field llama-server's `params` carries, so no client finds one missing. Samplers this
+      * server does not run are reported at their off values, which is what it serves. */
+@@ -352,8 +357,7 @@
+     o["build_info"]  = "radiance " + opt_.version;
+     o["role"]        = "model";
+     o["is_sleeping"] = false;
+-    metrics_.observe_http(200);
+-    return HttpResponse::json_body(200, json_dump(o));
++    return json_dump(o);
+ }
+ 
+ /* ================================================================== /get_tokenizer_info */
+@@ -424,6 +428,8 @@
+         e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
+         caps["reasoning_efforts"] = e;
+     }
++    caps["default_reasoning_effort"] = opt_.default_reasoning_effort.empty()
++                                           ? json(nullptr) : json(opt_.default_reasoning_effort);
+     return caps;
+ }
+ 
+--- a/core/server/front.cpp
++++ b/core/server/front.cpp
+@@ -325,7 +325,11 @@
+     }
+     e->aliases = aliases;
+     e->server = s;
+-    if (s) e->caps = s->capabilities_json();
++    if (s) {
++        e->caps = s->capabilities_json();
++        e->card = s->card_json();
++        e->props = s->props_json();
++    }
+     e->state = State::Open;
+     e->why.clear();
+     e->last_used_ns = rad_mono_ns();
+@@ -552,6 +556,10 @@
+ 
+ bool Front::dashboard_read(const HttpRequest& q) {
+     if (q.method != "GET") return false;
++    if (q.path == "/props") {
++        const auto it = q.query.find("autoload");
++        return it != q.query.end() && (it->second == "false" || it->second == "0");
++    }
+     return q.path == "/stats" || q.path == "/sessions" || q.path == "/graph" ||
+            q.path == "/server_info" || q.path == "/admin/control-vector";
+ }
+@@ -596,6 +604,11 @@
+         {
+             std::lock_guard<std::mutex> lk(mu_);
+             r = resolve(model);
++            if (r && r->state != State::Open && q.path == "/props" && !r->props.empty()) {
++                json props = json::parse(r->props);
++                props["is_sleeping"] = true;
++                return HttpResponse::json_body(200, props.dump());
++            }
+             if (r && r->state != State::Open)
+                 return refuse(q.path, 409, "model_not_open", "model '" + r->name + "' is " +
+                                                                  state_name(r->state) +
+@@ -746,26 +759,28 @@
+             if (!r)
+                 return refuse(q.path, 404, "not_found_error", "no model '" + id + "' is served here");
+             if (r->state != State::Open) {
+-                json card = {{"id", r->name}, {"object", "model"}, {"owned_by", "radiance"},
+-                             {"state", state_name(r->state)}};
++                json card = r->card.empty()
++                    ? json{{"id", r->name}, {"object", "model"}, {"owned_by", "radiance"}}
++                    : json::parse(r->card);
++                card["state"] = state_name(r->state);
+                 return HttpResponse::json_body(200, card.dump());
+             }
+             e = r;
+-            l = lease_entry(r);
++            l = lease_quiet(r);
+         }
+         HttpRequest one = q;
+         const size_t colon = id.find(':');
+         one.path = "/v1/models/" + (colon != std::string::npos ? id.substr(colon + 1) : e->name);
+         return e->server->router().dispatch(std::move(one));
+     }
+-    struct Row { Entry* e; std::shared_ptr<void> hold; std::string name; std::vector<std::string> aliases; State st; };
++    struct Row { Entry* e; std::shared_ptr<void> hold; std::string name; std::vector<std::string> aliases; State st; std::string card; };
+     std::vector<Row> rows;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
+         for (auto& p : entries_) {
+             if (p->removed) continue;
+-            Row r{p.get(), nullptr, p->name, p->aliases, p->state};
+-            if (p->state == State::Open) r.hold = lease_entry(p.get());
++            Row r{p.get(), nullptr, p->name, p->aliases, p->state, p->card};
++            if (p->state == State::Open) r.hold = lease_quiet(p.get());
+             rows.push_back(std::move(r));
+         }
+     }
+@@ -792,6 +807,7 @@
+                     cards.push_back(card);
+                 }
+         }
++        if (cards.empty() && !row.card.empty()) cards.push_back(json::parse(row.card));
+         if (cards.empty())
+             cards.push_back({{"id", row.name}, {"object", "model"}, {"owned_by", "radiance"}});
+         for (json& card : cards) {
+@@ -830,7 +846,7 @@
+                 if (e->state == State::Failed) j["error"] = e->why;
+                 return HttpResponse::json_body(503, j.dump());
+             }
+-            l = lease_entry(e);
++            l = lease_quiet(e);
+         }
+         return e->server->router().dispatch(q);
+     }
+@@ -845,7 +861,7 @@
+             if (p->removed) continue;
+             states[p->name] = state_name(p->state);
+             if (!p->required) continue;
+-            if (p->state == State::Open) held.emplace_back(p.get(), lease_entry(p.get()));
++            if (p->state == State::Open) held.emplace_back(p.get(), lease_quiet(p.get()));
+             else missing += (missing.empty() ? "" : ", ") + p->name;
+         }
+     }
+--- a/core/server/front.h
++++ b/core/server/front.h
+@@ -172,6 +172,8 @@
+         State                    state = State::Cold;
+         std::string              why;               /* State::Failed: the reason */
+         std::string              caps;              /* what it does, from when it last opened */
++        std::string              card;              /* its /v1/models card, from then */
++        std::string              props;             /* its /props body, from then */
+         uint64_t                 retry_ns = 0;      /* State::Failed: when a request may ask again */
+         int64_t                  wait_ms = 0;
+         bool                     required = false;
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -2313,6 +2313,15 @@
+                                                         { "usage", laya_usage(r) } }));
+ }
+ 
++std::string Server::card_json() const {
++    ModelCard c;
++    c.id = opt_.model_id;
++    c.created = started_at_;
++    c.max_model_len = opt_.max_ctx;
++    c.capabilities = capabilities().dump();
++    return model_body(c);
++}
++
+ HttpResponse Server::handle_models(const HttpRequest& req) {
+     const std::string id = req.param("id");
+     /* Runtime LoRA: each loaded adapter is a model of its own, whose parent is the served one. */
+--- a/core/server/server.h
++++ b/core/server/server.h
+@@ -278,6 +278,10 @@
+     int64_t  in_flight() const { return in_flight_.load(std::memory_order_relaxed); }
+     /* What this model does, as /server_info reports it, in JSON. */
+     std::string capabilities_json() const;
++    /* The served model's /v1/models card without `root`, and its /props body: kept by the Front
++     * so a model that is not loaded can still be described. */
++    std::string card_json() const;
++    std::string props_json() const;
+     /* The admission ceiling as resolved: ServerOptions::queue_depth, or 8 x max_seqs for 0. */
+     int64_t  queue_cap() const { return queue_depth_; }
+ 

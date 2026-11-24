@@ -98,6 +98,7 @@ stdenv.mkDerivation {
     ./patches/core-no-offload-compress.patch
     ./patches/xlmroberta.patch
     ./patches/inkling2loop.patch
+    ./patches/fleet-cold-metadata.patch
   ];
 
   nativeBuildInputs = [
